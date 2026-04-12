@@ -1,151 +1,81 @@
-"""Osram LIGHTIFY A19 RGBW device - Color Command Interceptor Version."""
+"""Osram LIGHTIFY A19 RGBW device - Color Command Interceptor."""
 
 import colorsys
-from zigpy.profiles import zha
-from zigpy.quirks import CustomCluster, CustomDevice
-import zigpy.zcl.clusters.lighting as lighting
-from zigpy.zcl.clusters.general import (
-    Basic, 
-    Groups, 
-    Identify, 
-    LevelControl, 
-    OnOff, 
-    Ota, 
-    Scenes,
-)
+from typing import Any
 
+from zigpy.quirks import CustomCluster
+from zigpy.quirks.v2 import QuirkBuilder
+from zigpy.zcl.clusters.lighting import Color
 from zhaquirks.osram import OSRAM, OsramLightCluster
-from zhaquirks.const import (
-    DEVICE_TYPE, 
-    ENDPOINTS, 
-    INPUT_CLUSTERS, 
-    MODELS_INFO, 
-    OUTPUT_CLUSTERS, 
-    PROFILE_ID,
-)
 
-class OsramColorInterceptor(CustomCluster, lighting.Color):
+
+class OsramColorInterceptor(CustomCluster, Color):
     """Intercept XY commands and translate them to HS."""
+    cluster_id = Color.cluster_id
 
-    async def command(self, command_id, *args, **kwargs):
+    # Gamut B Matrix constants for LED hardware
+    RGB_MATRIX = (
+        (1.656492, -0.354851, -0.255038),
+        (-0.707196, 1.655397, 0.036152),
+        (0.051713, -0.121364, 1.011530),
+    )
+
+    async def command(
+        self, command_id: int, *args: Any, **kwargs: Any
+    ) -> Any:  # Added type hints for Mypy
         """Intercept Move to Color (XY) and redirect to Move to Hue and Sat."""
-        
-        # 0x0007 is the 'Move to Color' (XY) command
-        if command_id == 0x0007:
-            x_raw = None
-            y_raw = None
-            tr_time = 0
 
-            # 1. Check kwargs (Common for service calls)
-            if "color_x" in kwargs:
-                x_raw = kwargs["color_x"]
-                y_raw = kwargs.get("color_y")
-                tr_time = kwargs.get("transition_time", 0)
-            
-            # 2. Check if args[0] is a command object (Common in newer zigpy)
-            elif args and hasattr(args[0], "color_x"):
-                x_raw = args[0].color_x
-                y_raw = args[0].color_y
-                tr_time = getattr(args[0], "transition_time", 0)
+        if command_id != Color.ServerCommandDefs.move_to_color.id:
+            return await super().command(command_id, *args, **kwargs)
 
-            # 3. Check positional args (Fallback for manual CLI commands)
-            elif len(args) >= 2:
-                x_raw = args[0]
-                y_raw = args[1]
-                tr_time = args[2] if len(args) > 2 else 0
+        # Simplified extraction
+        if "color_x" in kwargs:
+            x_raw = kwargs["color_x"]
+            y_raw = kwargs.get("color_y")
+            tr_time = kwargs.get("transition_time", 0)
+        elif args and hasattr(args[0], "color_x"):
+            x_raw = args[0].color_x
+            y_raw = args[0].color_y
+            tr_time = getattr(args[0], "transition_time", 0)
+        elif len(args) >= 2:
+            x_raw, y_raw = args[0], args[1]
+            tr_time = args[2] if len(args) > 2 else 0
+        else:
+            return await super().command(command_id, *args, **kwargs)
 
-            # If we successfully caught the values, perform the translation
-            if x_raw is not None and y_raw is not None:
-                try:
-                    # Normalize raw uint16 to 0.0 - 1.0
-                    x = x_raw / 65535.0
-                    y = y_raw / 65535.0
-                    
-                    # Prevent division by zero
-                    y = max(y, 0.000001)
-                                        
-                    # XY to Hue/Saturation
-                    h, s, _ = self.xy_to_hs(x, y)
+        try:
+            # Normalize and protect against division by zero
+            x = x_raw / 65535.0
+            y = max(y_raw / 65535.0, 0.000001)
 
-                    # Saturation Limiter (Tweak this to fix 'over-saturation')
-                    # SATURATION_LIMITER = 1 
-                    # s = min(1.0, s * SATURATION_LIMITER)
-                    
-                    # Scale for Zigbee (0-254 range)
-                    # Zigbee Hue 0xFE = 254
-                    zigbee_hue = max(0, min(254, int(h * 254)))
-                    zigbee_sat = max(0, min(254, int(s * 254)))
-                    
-                    # Send command 0x0006 (Move to Hue and Saturation)
-                    # We call move_to_hue_and_saturation directly as it handles formatting
-                    return await self.move_to_hue_and_saturation(
-                        hue=zigbee_hue,
-                        saturation=zigbee_sat,
-                        transition_time=tr_time
-                    )
-                except Exception:
-                    # Fallback to default XY if math goes sideways
-                    pass
+            h, s = self.xy_to_hs(x, y)
 
-        # Fallback to standard behavior for all other commands (or if translation failed)
-        return await super().command(command_id, *args, **kwargs)
+            # Scale to Zigbee 0-254 range
+            return await self.move_to_hue_and_saturation(
+                hue=max(0, min(254, int(h * 254))),
+                saturation=max(0, min(254, int(s * 254))),
+                transition_time=tr_time,
+            )
+        except (TypeError, ZeroDivisionError):
+            return await super().command(command_id, *args, **kwargs)
 
-    # Do the math to get from XY to Hue and Saturation. Assuming bulb supports Gamut B Matrix color space   
-    def xy_to_hs(self, x, y):
-        # XY to RGB Math
+    def xy_to_hs(self, x: float, y: float) -> tuple[float, float]:
+        """Translate XY coordinates to Hue and Saturation."""
         z = max(0.0, 1.0 - x - y)
-        Y_val = 1.0 
-        X_val = (Y_val / y) * x
-        Z_val = (Y_val / y) * z
-        
-        #sRGB Matrix (tuned for monitors)
-        #r = X_val * 3.2406 - Y_val * 1.5372 - Z_val * 0.4986
-        #g = -X_val * 0.9689 + Y_val * 1.8758 + Z_val * 0.0415
-        #b = X_val * 0.0557 - Y_val * 0.2040 + Z_val * 1.0570
+        x_val, y_val, z_val = (1.0 / y) * x, 1.0, (1.0 / y) * z
 
-        # Gamut B Matrix
-        # These values are tuned for LED hardware (rather than monitors)
-        r = X_val * 1.656492 - Y_val * 0.354851 - Z_val * 0.255038
-        g = -X_val * 0.707196 + Y_val * 1.655397 + Z_val * 0.036152
-        b = X_val * 0.051713 - Y_val * 0.121364 + Z_val * 1.011530
-        
-        # RGB to Hue/Saturation
-        h, s, v = colorsys.rgb_to_hsv(max(0, r), max(0, g), max(0, b))
+        # Apply Gamut B Matrix
+        r = x_val * self.RGB_MATRIX[0][0] + y_val * self.RGB_MATRIX[0][1] + z_val * self.RGB_MATRIX[0][2]
+        g = x_val * self.RGB_MATRIX[1][0] + y_val * self.RGB_MATRIX[1][1] + z_val * self.RGB_MATRIX[1][2]
+        b = x_val * self.RGB_MATRIX[2][0] + y_val * self.RGB_MATRIX[2][1] + z_val * self.RGB_MATRIX[2][2]
 
-        return h, s, v
+        h, s, _ = colorsys.rgb_to_hsv(max(0, r), max(0, g), max(0, b))
+        return h, s
 
 
-class LIGHTIFYA19RGBW(CustomDevice):
-    """Osram LIGHTIFY A19 RGBW device."""
-
-    signature = {
-        MODELS_INFO: [(OSRAM, "LIGHTIFY A19 RGBW")],
-        ENDPOINTS: {
-            3: {
-                PROFILE_ID: zha.PROFILE_ID,
-                DEVICE_TYPE: zha.DeviceType.COLOR_DIMMABLE_LIGHT,
-                INPUT_CLUSTERS: [
-                    Basic.cluster_id, Identify.cluster_id, Groups.cluster_id,
-                    Scenes.cluster_id, OnOff.cluster_id, LevelControl.cluster_id,
-                    lighting.Color.cluster_id, OsramLightCluster.cluster_id,
-                ],
-                OUTPUT_CLUSTERS: [Ota.cluster_id],
-            }
-        },
-    }
-
-    replacement = {
-        ENDPOINTS: {
-            3: {
-                PROFILE_ID: zha.PROFILE_ID,
-                DEVICE_TYPE: zha.DeviceType.COLOR_DIMMABLE_LIGHT,
-                INPUT_CLUSTERS: [
-                    Basic.cluster_id, Identify.cluster_id, Groups.cluster_id,
-                    Scenes.cluster_id, OnOff.cluster_id, LevelControl.cluster_id,
-                    OsramColorInterceptor, # The interceptor
-                    OsramLightCluster,
-                ],
-                OUTPUT_CLUSTERS: [Ota.cluster_id],
-            }
-        }
-    }
+(
+    QuirkBuilder(OSRAM, "LIGHTIFY A19 RGBW")
+    .replaces(OsramColorInterceptor, endpoint_id=3)
+    .replaces(OsramLightCluster, endpoint_id=3)
+    .add_to_registry()
+)
